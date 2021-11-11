@@ -3,12 +3,15 @@ Tool to enforce firewall rules based on web logs.
 
 ## Setup
 ```
+sudo apt install iptables ipset
+sudo cpan install JSON
+sudo cpan install File::Slurp
+sudo cpan install List::Compare
+
+
 git clone https://github.com/paralucid/Bouncer.git
-
 mv Bouncer/bouncer /usr/bin/bouncer
-
 sudo bouncer setup
-
 mv Bouncer/rules.json /etc/bouncer
 
 CRONTAB ENTRY: */1  * * *   root  bouncer enforce
