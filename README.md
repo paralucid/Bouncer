@@ -10,6 +10,8 @@ mv Bouncer/bouncer /usr/bin/bouncer
 sudo bouncer setup
 
 mv Bouncer/rules.json /etc/bouncer
+
+CRONTAB ENTRY: */1  * * *   root  bouncer enforce
 ```
 
 ## Interface
