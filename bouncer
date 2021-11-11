@@ -1,0 +1,542 @@
+#!/usr/bin/perl
+use strict;
+use warnings;
+use JSON qw(decode_json encode_json);
+use Data::Dumper;
+use Time::HiRes;
+use File::Path;
+use File::Copy;
+use File::Slurp qw(read_file);
+use List::Compare;
+
+#Copy nginx access log file to safe place
+#Parse log into json, save
+#Read rules.json file and compare against access.json
+#Apply ip blocks on match
+#Log what was blocked and why
+#Blow away the json and original log file
+#Repeat
+
+sub parse_access_log {
+
+    #ok, so.
+    #we can't mess with the nginx log, but we can copy it.
+    #so let's copy it into a temp file, compare it against the prior snapshot temp file
+    #and pull out the "new" additions. Parse the new additons, run them through the rule engine
+    #Look at File::Temp to accomplish this
+    #something like 'cp /var/log/nginx/access.log /etc/bouncer/current_snap.log'
+    #diff -u prev_snap.log current_snap.log | {FANCY GREP} > bouncer_input.txt
+    #rm prev_snap.log && mv current_snap.log prev_snap.log
+    #repeat.
+
+    copy('/var/log/nginx/access.log', '/tmp/current_snap.log');
+    #copy('/var/log/apache2/access.log', '/tmp/current_snap.log');
+
+
+    chomp( my @current = read_file '/tmp/current_snap.log');
+    chomp( my @prev = read_file '/tmp/prev_snap.log');
+
+    #print Dumper(@current);
+    #print Dumper(@prev);
+
+    my @diff = List::Compare->new( \@current, \@prev)->get_Lonly;
+    if(scalar(@diff) == 0){
+	    @diff = @current;
+    }
+
+    #blow away the prev, move current to prev
+    #unlink("/tmp/prev_snap.log");
+    move("/tmp/current_snap.log", "/tmp/prev_snap.log");
+
+    open(my $log, '>>', '/etc/bouncer/master_access.log') or die $!;
+
+    my %entries = ();
+
+    for(@diff){
+        #write the current line to master_access.log
+        print $log $_; 
+        chomp;
+
+        #my %entry = ();
+        my %values = ();
+
+        if(m/^(\S+).*\[(\S+).*\]\s"(.*?)"\s([0-9]{3}).*"(.*)"$/){
+            %values = (
+                #'ip_address' => $1,
+                'timestamp' => $2,
+                'request' => $3,
+                'status_code' => $4,
+                'user_agent' => $5,
+            ); 
+
+            $entries{$1} = [] unless(exists $entries{$1});
+            push @{$entries{$1}}, \%values;
+            #$entries{$1} = \%values;
+
+        } else { print "No match\n"; }
+    }
+
+    return %entries;
+}
+
+sub read_rules {
+    #my @entry = shift;
+
+    open(my $fh, '<', '/etc/bouncer/rules.json') or die "???: $!";
+    my $raw = join '',<$fh>;
+    my $json = JSON->new;
+    my $enable = $json->get_relaxed;
+    $json->relaxed([$enable]);
+    my $rules;
+    eval { $rules = $json->decode($raw) };
+    if($@){
+        print "[!] Could not read rules file. \n";
+        exit;
+    }
+
+    close $fh;
+    return $rules;
+}
+
+sub write_rules {
+    my $rules = shift;
+
+    open(my $out, '>', '/etc/bouncer/rules.json') or die $!;
+    my $json = JSON->new->allow_nonref;
+    print $out $json->pretty->encode($rules);
+
+    close $out;
+   
+}
+
+sub find_matches {
+    my ($rules, %entries) = @_;
+    my @set = $rules->{rules};
+    my @matches;
+    for (@set){
+	    for(@$_){
+            my $action = $_->{action};
+            my @rule_stack = $_->{rule_stack};
+            my @results = ();
+            my $stack = ();
+            my $values;
+
+            for my $entry (keys %entries){
+                for my $visit ($entries{$entry}){
+                    for(@$visit){
+                        $values = $_;
+                        $values->{ip} = $entry;
+
+                        my @checks = ();
+                        for my $stack (@rule_stack){
+                            for my $rule(@$stack) {
+                                if($values->{$rule->{attribute}} =~ m/\Q$rule->{contains}/i){
+                                    push @checks, 1;                              
+                                } else {
+                                    #entry in rule_stack failed to find, restart.
+                                    push @checks, 0;
+                                }
+                            }
+                        }
+
+                        #rulechain check to ensure all criteria have been met
+                        if( grep {/0/} @checks){
+                            next;
+                        } else {
+                            #print "GOT A MATCH\n";
+                            push @matches, $values;
+                        }
+                    }    
+                }
+            }
+        }
+    }
+    return @matches;
+}
+
+sub apply_rules {
+    my $matches = shift;
+
+    my $counter = 0;
+    #add matched bad ip's to the blacklist set
+    for my $match(@$matches){
+    #print Dumper($match);
+        $counter++;
+            my $bad_ip = $match->{ip};
+            #print "BLOCKING: ".$match->{ip}."\n";
+            system("ipset -A blacklist $bad_ip 2>/dev/null");
+            system("ipset save blacklist -f /etc/bouncer/black.list");
+    }
+
+    print "\nENTRIES ADDED: $counter\n\n";
+
+    #log what was blocked
+}
+
+sub list_matches {
+    my $matches = shift;
+    my $order = shift;
+
+    for my $match(@$matches){
+        for(@$order){
+            next unless(defined($match->{$_}));
+            printf "%-30s", $match->{$_};
+        }
+        print "\n";
+    }
+}
+
+sub create_ruleset {
+    my $rule_string = shift;
+
+    #match *exactly* 'and'
+    my @refined= grep { !/^and$/ } @$rule_string;
+
+    #check that the ruleset contains an even amount of values for hash conversion
+    unless(scalar(@refined) % 2 == 0){ die "[!] Invalid ruleset supplied.\nCheck that each key is assigned a value.\n" }
+
+    my %ruleset = @refined;
+
+    my @valid_keywords = (
+            'ip',
+            'timestamp',
+            'user_agent',
+            'request',
+            'status_code'
+    );
+
+    my @rule_stack;
+
+    for my $value(keys %ruleset){
+        if(scalar(grep { /^${value}$/ } @valid_keywords) == 0){
+            die "[!] Invalid keyword '$value'\n";
+        }
+        else {
+            my %pair = (
+                'attribute' => $value,
+                'contains' => $ruleset{$value}
+            );
+
+            push @rule_stack, \%pair;
+        }
+    }
+
+    my $rules_json = read_rules;
+
+    my %rulestack_entry = (
+        'rule_stack' => \@rule_stack,
+        'action' => 'block'
+    );
+
+    push @{$rules_json->{rules}}, \%rulestack_entry;
+
+    style_print("[+] Committing ruleset");
+    write_rules($rules_json);
+    print " OK\n";
+
+}
+
+sub style_print {
+        my $str = shift;
+
+        my $width = 50 - length($str);
+        my $pad = '.' x $width;
+        printf("%s %s", $str, $pad);
+}
+
+sub setup_zone {
+    my $zone_file = shift;
+    my $ipset_name = (split /\./, $zone_file)[0];
+
+
+    if(-e "/etc/bouncer/us.list"){
+        style_print("[+] Initializing $ipset_name ipset from us.list");
+        #Create a new ipset for US
+        system("ipset restore -f /etc/bouncer/us.list");
+        printf " [OK]\n";
+    }
+    elsif(-e "/etc/bouncer/us.zone") {
+        #Create a new ipset for US
+        system("ipset -N $ipset_name hash:net");
+        #printf " [OK]\n";
+
+        my $cmd = "ipset -A $ipset_name";
+
+        open(my $fh, '<', $zone_file) or die "Couldn't read $zone_file: $!";
+        chomp(my $len = `wc -l < $zone_file`);
+        my $count = 0;
+        my $pad = '.' x 32;
+        my $msg = "[+] Adding entries ".$pad;
+
+        while(<$fh>){
+                $count++;
+                printf "\r%s [%s/%s]", $msg, $count, $len;
+                STDOUT->flush();
+                system("$cmd $_");
+        }
+        print "\n";
+        close $fh;
+
+        style_print("[+] Saving $ipset_name ipset as 'us.list'");
+        system("ipset save $ipset_name -f /etc/bouncer/us.list");
+        printf " [OK]\n";
+
+        style_print("[+] Creating us ipset");
+        print " [OK]\n";
+
+        #setup_zone($zone_file)
+    }
+    else {
+        style_print("[+] Collecting $zone_file from ipdeny.com");
+        #Pull down a fresh listing for US IPs
+        system("wget -q -P . http://www.ipdeny.com/ipblocks/data/countries/$zone_file");
+        printf " [OK]\n";
+
+        setup_zone($zone_file);
+    }
+}
+
+sub ipset_initialize {
+    #us ipset doesn't exist, would they like to set it up?
+    if(! `ipset list -n | grep us`){
+        print "\nInitialize bouncer with us ipset? (Y/n): ";
+        chomp(my $c = <STDIN>);
+        if(lc $c eq 'n'){  
+            return;
+        }
+        setup_zone('us.zone');
+    }
+}
+
+sub blacklist_initialize {
+    #print "BLACKLIST\n";
+    #blacklist ipset doesn't exist, would they like to set it up?
+    if(! `ipset list -n | grep blacklist`){
+        print "\nCreate blacklist ipset? (Y/n): ";
+        chomp(my $c = <STDIN>);
+        if(lc $c eq 'n'){  
+            return;
+        }
+        else {
+            style_print("[+] Creating blacklist ipset");
+            #Create a new ipset for blacklist
+            system("ipset -N blacklist hash:net");
+            print " [OK]\n";
+        }
+    }
+    #looks like there's a file to restore from
+    if(-e "/etc/bouncer/black.list"){
+        print "\nRestore blacklist from '/etc/bouncer/black.list'? (Y/n): ";
+        chomp(my $c = <STDIN>);
+        if(lc $c ne 'n'){  
+            style_print("[+] Restoring blacklist ipset");
+            system("ipset restore -f /etc/bouncer/black.list");
+            print " [OK]\n";
+        }
+    }
+    
+} 
+
+sub iptables_initialize {
+    #print "IPTABLES\n";
+    if(-e '/etc/bouncer/firewall.rules'){
+        print "Use iptables rules from 'firewall.rules'? (Y/n): ";
+        chomp(my $c = <STDIN>);
+        if(lc $c ne 'n'){  
+            style_print("[+] Initializing iptables ruleset");
+            system("iptables-restore /etc/bouncer/firewall.rules");
+            print " [OK]\n";
+            return;
+        }
+    }
+
+    my @iptables = (
+        "*filter",
+        ":INPUT ACCEPT [0:0]",
+        ":FORWARD ACCEPT [0:0]",
+        ":OUTPUT ACCEPT [0:0]",
+        ":Bogus - [0:0]",
+        "-A INPUT -j Bogus",
+        "-A INPUT -i lo -j ACCEPT",
+        "-A FORWARD -j Bogus",
+        "-A INPUT -m state --state RELATED,ESTABLISHED -j ACCEPT",
+        "-A INPUT -m set ! --match-set us src -j DROP",
+        "-A INPUT -m set --match-set blacklist src -j DROP",
+        "-A Bogus -p tcp -m tcp --tcp-flags SYN,FIN SYN,FIN -j DROP",
+        "-A Bogus -p tcp -m tcp --tcp-flags SYN,RST SYN,RST -j DROP",
+        "COMMIT"
+    );
+
+    open(my $out, '>', '/etc/bouncer/firewall.rules') or die $!;
+
+    if(! `ipset list -n | grep us`){
+        @iptables = grep { !/.*match-set us.*/ } @iptables;
+    }
+
+    if(! `ipset list -n | grep blacklist`){
+        @iptables = grep { !/.*match-set blacklist.*/ } @iptables;
+    }
+
+    print $out $_."\n" for(@iptables);
+    close $out;
+
+    style_print("[+] Initializing iptables ruleset");
+    system("iptables-restore /etc/bouncer/firewall.rules");
+    print " [OK]\n";
+}
+
+#TODO
+sub clean_setup {
+    #handle all the initialization of ipsets, iptable rules, etc
+    #have checks for the rules.json, config.json, etc.
+    #query for a cron job, if there isn't one prompt the user for an interval and set on up
+    #check for /etc/bouncer
+    if(-e '/etc/bouncer'){
+        print "Directory '/etc/bouncer/' exists. Overwrite contents? (Y/n): ";
+        chomp(my $c = <STDIN>);
+        if(lc $c ne 'n'){ 
+            #check for a blacklist file, they'd want to save that
+
+            style_print("[+] Overwriting directory");
+            rmtree("/etc/bouncer") or die "Unable to delete /etc/bouncer: $!\n\n";
+            mkdir("/etc/bouncer") or die "Unable to create /etc/bouncer: $!\n\n";
+            print " [OK]\n";
+        }
+    }
+    else {
+        print "[+] Clean setup. Creating '/etc/bouncer/'\n";
+        #either way, clean dir
+        mkdir("/etc/bouncer") or die "Unable to create /etc/bouncer: $!\n\n";
+    }
+
+    chdir("/etc/bouncer");
+
+    ipset_initialize;
+    blacklist_initialize;
+    iptables_initialize;
+}
+
+sub reset_all {
+    system("iptables -F");
+    system("ipset destroy");
+    rmtree("/etc/bouncer") or die "Unable to delete /etc/bouncer: $!\n\n";
+}
+
+sub list_rules {
+    my @rules = (read_rules->{rules});
+    my @stacks;
+    for my $rule(@rules){
+        for my $r (@$rule){
+            push @stacks, $r->{rule_stack};
+        }
+    }
+    
+    printf "%s RULE PAIRS %s\n",'-'x37,'-'x37;
+    for(@stacks){
+        my @line;
+        for(@$_){
+            push @line, sprintf "%-12s CONTAINS   %-26s", $_->{attribute}, $_->{contains};
+        }
+
+        my $c = scalar(@line);
+        for(@line){
+            print $_;
+            $c--;
+            print " AND " unless $c == 0;
+            
+        }
+        print "\n";
+    }
+}
+
+sub defense_status {
+    #present a clean display of the firewall status
+    #Current blacklisted IP count
+    #Last nth entries into pests.log
+    #ipsets currently enforced
+}
+
+sub interface {
+    #Sample command for new rule
+    #block user_agent python and request phpmyadmin
+    #log user_agent curl and status_code 404
+    #allow 
+}
+
+sub main {
+    #package up what you can. Might have build out the cron script separately
+    #include an empty config.json and rules.json
+    #should be git clone https://github.com/paralucid/bouncer.git
+    #bouncer setup
+
+    #SAMPLE COMMANDS
+    #bouncer block ip_address 1.2.3.4
+    #bouncer block user_agent python and request foobar
+    #bouncer status
+    #bouncer settings interval 5
+    #bouncer log user_agent curl
+    #bouncer list ipset
+    #bouncer list zones
+
+    my $banner = "
+ ______   _____  _     _ __   _ _______ _______  ______
+ |_____] |     | |     | | \\  | |       |______ |_____/
+ |_____] |_____| |_____| |  \\_| |_____  |______ |    \\_\n\n";
+    die " [!] Must be executed as root\n\n" unless $> == 0;
+
+    
+
+    if($ARGV[0] eq 'enforce'){
+        my %entries = parse_access_log;
+        my $rules = read_rules;
+        my @matches = find_matches($rules, %entries);
+
+        apply_rules(\@matches);
+    }
+    #iptables_initialize;
+    elsif($ARGV[0] eq 'setup'){
+       print $banner;
+       clean_setup; 
+    }
+
+    elsif($ARGV[0] eq 'reset'){
+       print $banner;
+       reset_all;
+    }
+
+    elsif($ARGV[0] eq 'rules'){
+       print $banner;
+       list_rules;
+    }
+    
+    elsif($ARGV[0] eq 'block'){
+        print $banner;
+        shift @ARGV;
+        create_ruleset(\@ARGV);
+    }
+
+    elsif($ARGV[0] eq 'list'){
+        print $banner;	
+        my %entries = parse_access_log;
+        my $rules = read_rules;
+        my @matches = find_matches($rules, %entries);
+
+        my @order = (
+            'ip',
+            #'timestamp',
+            'user_agent',
+            #'request',
+            #'status_code'
+        );
+        list_matches(\@matches, \@order);
+    }
+
+    else {
+	print $banner;
+        die "[!] No args supplied!\n"
+    }
+
+}
+
+main
+
